@@ -207,6 +207,51 @@ def verify_probe(settings: G35Settings, osd_id: int) -> dict[str, Any]:
     return {"osd_id": osd_id, "path": str(path), "status": "ok"}
 
 
+def create_probes(settings: G35Settings, execute: bool, overwrite: bool) -> dict[str, Any]:
+    build_payload = _yrfs_ops()[1] if execute else None
+    details: list[dict[str, Any]] = []
+    created = 0
+    skipped = 0
+    for osd_id in settings.osd_ids:
+        path = _probe_path(settings, osd_id)
+        exists = path.exists()
+        entry: dict[str, Any] = {"osd_id": osd_id, "path": str(path)}
+        if not execute:
+            if exists and not overwrite:
+                entry["status"] = "would_skip_exists"
+                skipped += 1
+            else:
+                entry["status"] = "would_overwrite" if exists else "would_create"
+            details.append(entry)
+            continue
+        if exists and not overwrite:
+            entry["status"] = "skipped_exists"
+            skipped += 1
+            details.append(entry)
+            continue
+        payload = build_payload(settings.cluster_id, osd_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(path.name + ".tmp")
+        tmp_path.write_bytes(payload)
+        os.replace(tmp_path, path)
+        verify = verify_probe(settings, osd_id)
+        entry["bytes"] = len(payload)
+        entry["verify"] = verify["status"]
+        entry.update({k: v for k, v in verify.items() if k not in {"osd_id", "path", "status"}})
+        entry["status"] = "created" if verify["status"] == "ok" else f"created_but_{verify['status']}"
+        created += 1
+        details.append(entry)
+    return {
+        "mode": "execute" if execute else "dry-run",
+        "cluster_id": settings.cluster_id,
+        "mount_path": str(settings.mount_path),
+        "matched": len(details),
+        "created": created,
+        "skipped": skipped,
+        "probes": details,
+    }
+
+
 def _as_bytes(value: bytes | str) -> bytes:
     return value if isinstance(value, bytes) else value.encode("utf-8")
 
@@ -426,6 +471,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     _add_mode_options(delete_files_parser)
     delete_files_parser.add_argument("--report")
 
+    create_probes_parser = subparsers.add_parser(
+        "create-probes",
+        help="为配置中的每个 OSD 创建探活文件并写入校验内容",
+    )
+    create_probes_parser.add_argument("--config", required=True, help="YRCache YAML 配置文件")
+    create_probes_parser.add_argument(
+        "--overwrite", action="store_true", help="覆盖已存在的探活文件，默认跳过"
+    )
+    _add_mode_options(create_probes_parser)
+    create_probes_parser.add_argument("--report")
+
     verify_parser = subparsers.add_parser("verify-recovery", help="验证 OSD 恢复的静态条件")
     _add_config_redis_options(verify_parser)
     verify_parser.add_argument("--osd-id", type=int, required=True)
@@ -450,6 +506,12 @@ def _handle_list_files(args: argparse.Namespace) -> int:
         files = list_files(g35.mount_path, args.osd_id)
         report = {"mount_path": str(g35.mount_path), "osd_id": args.osd_id, "files": list(files)}
     _write_report(report, args.output)
+    return 0
+
+
+def _handle_create_probes(args: argparse.Namespace) -> int:
+    g35 = _load_g35_settings(args)
+    _write_report(create_probes(g35, args.execute, args.overwrite), args.report)
     return 0
 
 
@@ -530,6 +592,8 @@ def _handle_verify_recovery(
 def _execute(args: argparse.Namespace) -> int:
     if args.command == "list-files":
         return _handle_list_files(args)
+    if args.command == "create-probes":
+        return _handle_create_probes(args)
     shared = _load_shared_config(args.config)
     file_paths = load_manifest(args.manifest)
     settings, client, result = _scan_command_records(args, shared, file_paths)
