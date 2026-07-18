@@ -235,13 +235,18 @@ def verify_probe(settings: G35Settings, osd_id: int) -> dict[str, Any]:
 
 
 def create_probes(
-    settings: G35Settings, execute: bool, overwrite: bool, verbose: bool = False
+    settings: G35Settings,
+    execute: bool,
+    overwrite: bool,
+    verbose: bool = False,
+    osd_ids: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     build_payload = _yrfs_ops()[1] if execute else None
     details: list[dict[str, Any]] = []
     created = 0
     skipped = 0
-    for osd_id in settings.osd_ids:
+    selected_osd_ids = settings.osd_ids if osd_ids is None else osd_ids
+    for osd_id in selected_osd_ids:
         path = _probe_path(settings, osd_id)
         exists = path.exists()
         entry: dict[str, Any] = {"osd_id": osd_id, "path": str(path)}
@@ -550,6 +555,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     create_probes_parser.add_argument("--config", required=True, help="YRCache YAML 配置文件")
     create_probes_parser.add_argument(
+        "--osd-id",
+        "--osd_id",
+        dest="osd_ids",
+        type=int,
+        nargs="+",
+        metavar="OSD_ID",
+        help="只处理指定的一个或多个 OSD；默认处理配置中的全部 OSD",
+    )
+    create_probes_parser.add_argument(
         "--overwrite", action="store_true", help="覆盖已存在的探活文件，默认跳过"
     )
     create_probes_parser.add_argument(
@@ -587,7 +601,23 @@ def _handle_list_files(args: argparse.Namespace) -> int:
 
 def _handle_create_probes(args: argparse.Namespace) -> int:
     g35 = _load_g35_settings(args)
-    _write_report(create_probes(g35, args.execute, args.overwrite, args.verbose), args.report)
+    osd_ids = tuple(args.osd_ids) if args.osd_ids else None
+    if osd_ids is not None:
+        if len(osd_ids) != len(set(osd_ids)):
+            raise ValueError("--osd-id 不能包含重复的 OSD ID")
+        unknown = [osd_id for osd_id in osd_ids if osd_id not in g35.osd_ids]
+        if unknown:
+            raise ValueError(
+                f"--osd-id 包含配置 g35_osd_ids 中不存在的 OSD: {unknown}"
+            )
+    report = create_probes(
+        g35,
+        args.execute,
+        args.overwrite,
+        args.verbose,
+        osd_ids,
+    )
+    _write_report(report, args.report)
     return 0
 
 

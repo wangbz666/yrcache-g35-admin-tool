@@ -332,6 +332,25 @@ python g35_admin.py create-probes \
   --report "$WORK_DIR/create-probes-report.json"
 ```
 
+只重建指定的一个或多个 OSD：
+
+```bash
+# 单个 OSD
+python g35_admin.py create-probes \
+  --config "$YRCACHE_CONFIG" \
+  --osd-id 101 \
+  --execute --overwrite --verbose
+
+# 多个 OSD
+python g35_admin.py create-probes \
+  --config "$YRCACHE_CONFIG" \
+  --osd-id 101 103 104 \
+  --execute --overwrite --verbose
+```
+
+`--osd-id`（也兼容 `--osd_id`）后可跟一个或多个 ID；不提供时处理配置
+`g35_osd_ids` 中的全部 OSD。指定的 ID 必须存在于配置中，且不能重复。
+
 `--verbose` 会把每个 OSD 的分步日志打到 stderr（生成 payload → `yrcli --create` → 写入内容 → 校验），失败时会带上 `yrcli` 的 stdout/stderr，便于定位后手动复现。
 
 路径格式：
