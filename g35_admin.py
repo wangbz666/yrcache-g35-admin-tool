@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import struct
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -190,6 +191,32 @@ def _yrfs_ops() -> tuple[Any, Any]:
     return c_ops._g35_query_yrfs_file_osds, c_ops._g35_probe_payload
 
 
+def _log(verbose: bool, message: str) -> None:
+    if verbose:
+        print(f"yrcache-g35-admin: {message}", file=sys.stderr)
+
+
+def _yrcli_create_command(path: Path, osd_id: int) -> list[str]:
+    return [
+        "yrcli",
+        "--create",
+        "--stripesize=1m",
+        "--stripecount=1",
+        "--pool=default",
+        str(path),
+        f"--owners={osd_id}",
+    ]
+
+
+def _create_probe_with_yrcli(path: Path, osd_id: int) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        _yrcli_create_command(path, osd_id),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def verify_probe(settings: G35Settings, osd_id: int) -> dict[str, Any]:
     query_layout, build_payload = _yrfs_ops()
     path = _probe_path(settings, osd_id)
@@ -207,7 +234,9 @@ def verify_probe(settings: G35Settings, osd_id: int) -> dict[str, Any]:
     return {"osd_id": osd_id, "path": str(path), "status": "ok"}
 
 
-def create_probes(settings: G35Settings, execute: bool, overwrite: bool) -> dict[str, Any]:
+def create_probes(
+    settings: G35Settings, execute: bool, overwrite: bool, verbose: bool = False
+) -> dict[str, Any]:
     build_payload = _yrfs_ops()[1] if execute else None
     details: list[dict[str, Any]] = []
     created = 0
@@ -216,30 +245,74 @@ def create_probes(settings: G35Settings, execute: bool, overwrite: bool) -> dict
         path = _probe_path(settings, osd_id)
         exists = path.exists()
         entry: dict[str, Any] = {"osd_id": osd_id, "path": str(path)}
+        _log(verbose, f"[osd={osd_id}] 开始处理 path={path} exists={exists}")
         if not execute:
             if exists and not overwrite:
                 entry["status"] = "would_skip_exists"
                 skipped += 1
             else:
                 entry["status"] = "would_overwrite" if exists else "would_create"
+            _log(verbose, f"[osd={osd_id}] dry-run status={entry['status']}")
             details.append(entry)
             continue
         if exists and not overwrite:
             entry["status"] = "skipped_exists"
             skipped += 1
+            _log(verbose, f"[osd={osd_id}] 跳过已存在文件")
             details.append(entry)
             continue
+        _log(verbose, f"[osd={osd_id}] 步骤1/4: 生成 payload")
         payload = build_payload(settings.cluster_id, osd_id)
+        _log(verbose, f"[osd={osd_id}] payload bytes={len(payload)}")
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(path.name + ".tmp")
-        tmp_path.write_bytes(payload)
-        os.replace(tmp_path, path)
+        if path.exists():
+            _log(verbose, f"[osd={osd_id}] 删除已存在文件以便覆盖")
+            path.unlink()
+        command = _yrcli_create_command(path, osd_id)
+        _log(verbose, f"[osd={osd_id}] 步骤2/4: 执行 {' '.join(command)}")
+        try:
+            result = _create_probe_with_yrcli(path, osd_id)
+        except FileNotFoundError:
+            error_msg = "找不到 yrcli 命令，请确认已安装并在 PATH 中"
+            entry["status"] = "yrcli_error"
+            entry["error"] = error_msg
+            created += 1
+            _log(verbose, f"[osd={osd_id}] 失败 status=yrcli_error error={error_msg}")
+            details.append(entry)
+            continue
+        if result.stdout and result.stdout.strip():
+            _log(verbose, f"[osd={osd_id}] yrcli stdout:\n{result.stdout.rstrip()}")
+        if result.stderr and result.stderr.strip():
+            _log(verbose, f"[osd={osd_id}] yrcli stderr:\n{result.stderr.rstrip()}")
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            error_msg = (
+                f"yrcli 创建探活文件失败: {path} (exit={result.returncode}"
+                + (f", {detail}" if detail else "")
+                + ")"
+            )
+            entry["status"] = "yrcli_error"
+            entry["error"] = error_msg
+            created += 1
+            _log(verbose, f"[osd={osd_id}] 失败 status=yrcli_error error={error_msg}")
+            details.append(entry)
+            continue
+        _log(verbose, f"[osd={osd_id}] yrcli 成功 exit={result.returncode}")
+        _log(verbose, f"[osd={osd_id}] 步骤3/4: 写入 payload")
+        path.write_bytes(payload)
+        _log(verbose, f"[osd={osd_id}] 步骤4/4: 校验布局与内容")
         verify = verify_probe(settings, osd_id)
         entry["bytes"] = len(payload)
         entry["verify"] = verify["status"]
         entry.update({k: v for k, v in verify.items() if k not in {"osd_id", "path", "status"}})
         entry["status"] = "created" if verify["status"] == "ok" else f"created_but_{verify['status']}"
         created += 1
+        extra = {k: v for k, v in entry.items() if k not in {"osd_id", "path", "status", "bytes", "verify"}}
+        _log(
+            verbose,
+            f"[osd={osd_id}] 完成 status={entry['status']} verify={verify['status']}"
+            + (f" detail={extra}" if extra else ""),
+        )
         details.append(entry)
     return {
         "mode": "execute" if execute else "dry-run",
@@ -479,6 +552,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     create_probes_parser.add_argument(
         "--overwrite", action="store_true", help="覆盖已存在的探活文件，默认跳过"
     )
+    create_probes_parser.add_argument(
+        "--verbose", action="store_true", help="输出每个 OSD 的分步执行日志到 stderr"
+    )
     _add_mode_options(create_probes_parser)
     create_probes_parser.add_argument("--report")
 
@@ -511,7 +587,7 @@ def _handle_list_files(args: argparse.Namespace) -> int:
 
 def _handle_create_probes(args: argparse.Namespace) -> int:
     g35 = _load_g35_settings(args)
-    _write_report(create_probes(g35, args.execute, args.overwrite), args.report)
+    _write_report(create_probes(g35, args.execute, args.overwrite, args.verbose), args.report)
     return 0
 
 

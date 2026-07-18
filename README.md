@@ -47,7 +47,7 @@ pip install redis PyYAML
 - `_g35_query_yrfs_file_osds(path)`：查询 YRFS 文件实际分布在哪些 OSD 上。
 - `_g35_probe_payload(cluster_id, osd_id)`：生成探活文件内容。
 
-`create-probes --dry-run` 不加载 `c_ops`，只预览路径；`--execute` 会加载 `c_ops` 并写入内容。
+`create-probes --dry-run` 不加载 `c_ops`，只预览路径；`--execute` 会调用 `yrcli --create` 建立 YRFS 布局，加载 `c_ops` 写入内容并校验。
 
 ## 配置文件
 
@@ -317,6 +317,7 @@ python g35_admin.py create-probes \
 python g35_admin.py create-probes \
   --config "$YRCACHE_CONFIG" \
   --execute \
+  --verbose \
   --report "$WORK_DIR/create-probes-report.json"
 ```
 
@@ -327,8 +328,11 @@ python g35_admin.py create-probes \
   --config "$YRCACHE_CONFIG" \
   --execute \
   --overwrite \
+  --verbose \
   --report "$WORK_DIR/create-probes-report.json"
 ```
+
+`--verbose` 会把每个 OSD 的分步日志打到 stderr（生成 payload → `yrcli --create` → 写入内容 → 校验），失败时会带上 `yrcli` 的 stdout/stderr，便于定位后手动复现。
 
 路径格式：
 
@@ -359,10 +363,11 @@ shared_storage_cache_config:
 - 文件不是空文件。
 - 内容由 `_g35_probe_payload(g35_cluster_id, osd_id)` 生成。
 - 该 payload 和 `verify_probe` 后续校验使用的是同一套逻辑。
-- 写入采用临时文件 `.tmp` + `os.replace`，避免半写文件。
+- 创建时先调用 `yrcli --create --stripesize=1m --stripecount=1 --pool=default <path> --owners=<osd_id>` 建立 YRFS 布局，再写入 payload。
+- 覆盖已有探活文件时会先删除旧文件，再重新执行 `yrcli --create`。
 - 写完后立即调用 `verify_probe`，校验文件布局和内容。
 
-注意：脚本当前通过写入后回读校验来确认布局。是否能让新文件只落在目标 OSD 上，取决于 YRFS 的文件布局策略和底层能力。如果 YRFS 没有把该探活文件放到唯一目标 OSD，报告会显示 `created_but_wrong_layout`。
+注意：运行环境中需要能直接执行 `yrcli`。如果 `yrcli` 创建失败，报告会显示 `yrcli_error`；如果布局未落在唯一目标 OSD，报告会显示 `created_but_wrong_layout`。
 
 ### create-probes 状态说明
 
@@ -380,6 +385,7 @@ execute 状态：
 | --- | --- |
 | `created` | 已写入探活文件，并且布局和内容校验通过。 |
 | `skipped_exists` | 文件已存在，未指定 `--overwrite`，跳过未改。 |
+| `yrcli_error` | `yrcli --create` 执行失败。报告中会带 `error`。 |
 | `created_but_layout_error` | 文件已写入，但查询 YRFS 布局失败。报告中会带 `error_code`。 |
 | `created_but_wrong_layout` | 文件已写入，但实际布局不是只落在目标 OSD。报告中会带 `actual_osds`。 |
 | `created_but_read_error` | 文件已写入，但回读文件失败。报告中会带 `error`。 |
