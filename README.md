@@ -55,7 +55,8 @@ pip install redis PyYAML
 
 ```yaml
 shared_storage_cache_config:
-  mount_path: "/mnt/wbz"
+  mount_path: "/mnt/real-yrfs"
+  data_sub_path: "/yrcache_01"
   g35_cluster_id: "wbz-test-cluster"
   g35_osd_ids: [101, 102, 103, 104]
 
@@ -71,7 +72,8 @@ shared_storage_cache_config:
 
 | 字段 | 必填 | 用途 |
 | --- | --- | --- |
-| `mount_path` | 是 | YRFS 挂载点。所有文件扫描、删除、探活路径都基于它。 |
+| `mount_path` | 是 | YRFS 挂载点。探活文件、删除路径校验都基于它。 |
+| `data_sub_path` | 是 | 相对 `mount_path` 的业务数据子目录。`list-files` 只扫描 `mount_path + data_sub_path`。 |
 | `g35_cluster_id` | 是 | G3.5 集群 ID，用于探活路径和探活内容。 |
 | `g35_osd_ids` | 是 | 当前集群有效 OSD ID 列表，必须是非重复无符号 32 位整数。 |
 | `redis_host` | Redis 命令必填 | Redis 地址。也可通过 `--redis-host` 覆盖。 |
@@ -121,20 +123,31 @@ python g35_admin.py list-files \
 
 扫描逻辑：
 
-- 递归扫描 `mount_path` 下所有普通文件。
+- 只递归扫描数据目录 `mount_path + data_sub_path`，例如 `/mnt/real-yrfs/yrcache_01`。
+- 不扫描探活目录 `.yrcache_g35_probes/` 等挂载点下的其他路径。
 - 精确解析文件名中最后一个 `_osds_` 后面的 OSD ID 列表。
 - OSD ID 列表格式为十进制整数，多个 OSD 用 `-` 分隔，例如 `_osds_101-102-103.dat`。
 - 不使用 `*7*` 这类模糊匹配，所以不会把 `17`、`70`、`107` 误判成 `7`。
+- 对故障 OSD 文件，`stat`/`is_file` 可能返回 I/O error；此时仍按文件名匹配并收录，同时把错误记入 `scan_errors`，不会中断整次扫描。
+- 清单中的路径仍相对 `mount_path`，例如 `yrcache_01/worker_id_1/cache_a_osds_7-8.dat`。
 
 输出示例：
 
 ```json
 {
-  "mount_path": "/mnt/wbz",
+  "mount_path": "/mnt/real-yrfs",
+  "data_path": "/mnt/real-yrfs/yrcache_01",
   "osd_id": 7,
   "files": [
-    "worker_id_1/cache_a_osds_7-8.dat",
-    "worker_id_2/cache_b_osds_3-7.dat"
+    "yrcache_01/worker_id_1/cache_a_osds_7-8.dat",
+    "yrcache_01/worker_id_2/cache_b_osds_3-7.dat"
+  ],
+  "scan_errors": [
+    {
+      "path": "yrcache_01/worker_id_1/cache_a_osds_7-8.dat",
+      "error": "OSError: [Errno 5] Input/output error",
+      "phase": "stat"
+    }
   ]
 }
 ```
@@ -152,7 +165,8 @@ python g35_admin.py list-files \
 
 ```json
 {
-  "mount_path": "/mnt/wbz",
+  "mount_path": "/mnt/real-yrfs",
+  "data_path": "/mnt/real-yrfs/yrcache_01",
   "files": 2,
   "existing": 2
 }
@@ -161,13 +175,13 @@ python g35_admin.py list-files \
 字段说明：
 
 - `files`：清单中的文件数量。
-- `existing`：当前仍存在于 `mount_path` 下的文件数量。
+- `existing`：当前仍存在于 `mount_path` 下的文件数量。访问返回 I/O error 的路径也计为存在。
 
 清单可以是 JSON 数组：
 
 ```json
 [
-  "worker_id_1/cache_a_osds_7-8.dat"
+  "yrcache_01/worker_id_1/cache_a_osds_7-8.dat"
 ]
 ```
 
@@ -199,7 +213,7 @@ python g35_admin.py list-redis-records \
   "records": [
     {
       "key": "1:2:3:abc:def",
-      "file_path": "worker_id_1/cache_a_osds_7-8.dat",
+      "file_path": "yrcache_01/worker_id_1/cache_a_osds_7-8.dat",
       "offset": 0,
       "real_size": 4096,
       "alloc_size": 4096
@@ -363,7 +377,8 @@ python g35_admin.py create-probes \
 
 ```yaml
 shared_storage_cache_config:
-  mount_path: "/mnt/wbz"
+  mount_path: "/mnt/real-yrfs"
+  data_sub_path: "/yrcache_01"
   g35_cluster_id: "wbz-test-cluster"
   g35_osd_ids: [101, 102, 103, 104]
 ```
@@ -371,10 +386,10 @@ shared_storage_cache_config:
 执行后会创建：
 
 ```text
-/mnt/wbz/.yrcache_g35_probes/wbz-test-cluster/probe_osd_101.dat
-/mnt/wbz/.yrcache_g35_probes/wbz-test-cluster/probe_osd_102.dat
-/mnt/wbz/.yrcache_g35_probes/wbz-test-cluster/probe_osd_103.dat
-/mnt/wbz/.yrcache_g35_probes/wbz-test-cluster/probe_osd_104.dat
+/mnt/real-yrfs/.yrcache_g35_probes/wbz-test-cluster/probe_osd_101.dat
+/mnt/real-yrfs/.yrcache_g35_probes/wbz-test-cluster/probe_osd_102.dat
+/mnt/real-yrfs/.yrcache_g35_probes/wbz-test-cluster/probe_osd_103.dat
+/mnt/real-yrfs/.yrcache_g35_probes/wbz-test-cluster/probe_osd_104.dat
 ```
 
 内容说明：
@@ -416,14 +431,14 @@ execute 状态：
 {
   "mode": "execute",
   "cluster_id": "wbz-test-cluster",
-  "mount_path": "/mnt/wbz",
+  "mount_path": "/mnt/real-yrfs",
   "matched": 4,
   "created": 4,
   "skipped": 0,
   "probes": [
     {
       "osd_id": 101,
-      "path": "/mnt/wbz/.yrcache_g35_probes/wbz-test-cluster/probe_osd_101.dat",
+      "path": "/mnt/real-yrfs/.yrcache_g35_probes/wbz-test-cluster/probe_osd_101.dat",
       "bytes": 64,
       "verify": "ok",
       "status": "created"

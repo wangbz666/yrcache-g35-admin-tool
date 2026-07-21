@@ -60,12 +60,30 @@ class ScanResult:
 @dataclass(frozen=True)
 class G35Settings:
     mount_path: Path
+    data_sub_path: str
     cluster_id: str
     osd_ids: tuple[int, ...]
+
+    @property
+    def data_path(self) -> Path:
+        return self.mount_path / self.data_sub_path if self.data_sub_path else self.mount_path
 
 
 class SharedValueDecodeError(ValueError):
     pass
+
+
+def _normalize_data_sub_path(value: Any) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    return text.strip("/")
+
+
+def _path_exists_tolerant(path: Path) -> bool:
+    """Path exists, or is inaccessible due to YRFS I/O error (treat as present)."""
+    try:
+        return path.exists()
+    except OSError:
+        return True
 
 
 def _read(fmt: str, raw: bytes, pos: int) -> tuple[Any, int]:
@@ -135,17 +153,63 @@ def parse_osd_ids_from_filename(path: str | Path) -> tuple[int, ...] | None:
     return osd_ids
 
 
-def list_files(mount_path: Path, osd_id: int) -> tuple[str, ...]:
-    if not mount_path.is_dir():
-        raise ValueError(f"YRFS 挂载点不存在或不是目录: {mount_path}")
-    files = []
-    for path in mount_path.rglob("*"):
-        if not path.is_file():
+def list_files(
+    settings: G35Settings, osd_id: int
+) -> tuple[tuple[str, ...], tuple[dict[str, Any], ...]]:
+    data_root = settings.data_path
+    if not data_root.is_dir():
+        raise ValueError(f"YRFS 数据目录不存在或不是目录: {data_root}")
+
+    files: list[str] = []
+    scan_errors: list[dict[str, Any]] = []
+    stack = [data_root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as iterator:
+                entries = list(iterator)
+        except OSError as error:
+            scan_errors.append(
+                {
+                    "path": str(current.relative_to(settings.mount_path).as_posix())
+                    if current != settings.mount_path
+                    else ".",
+                    "error": f"{type(error).__name__}: {error}",
+                    "phase": "scandir",
+                }
+            )
             continue
-        osd_ids = parse_osd_ids_from_filename(path.name)
-        if osd_ids is not None and osd_id in osd_ids:
-            files.append(path.relative_to(mount_path).as_posix())
-    return tuple(sorted(files))
+
+        for entry in entries:
+            path = Path(entry.path)
+            relative = path.relative_to(settings.mount_path).as_posix()
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+                is_file = entry.is_file(follow_symlinks=False)
+            except OSError as error:
+                # 故障 OSD 上的文件 stat 会 EIO；仍按文件名匹配收录。
+                scan_errors.append(
+                    {
+                        "path": relative,
+                        "error": f"{type(error).__name__}: {error}",
+                        "phase": "stat",
+                    }
+                )
+                osd_ids = parse_osd_ids_from_filename(entry.name)
+                if osd_ids is not None and osd_id in osd_ids:
+                    files.append(relative)
+                continue
+
+            if is_dir:
+                stack.append(path)
+                continue
+            if not is_file:
+                continue
+            osd_ids = parse_osd_ids_from_filename(entry.name)
+            if osd_ids is not None and osd_id in osd_ids:
+                files.append(relative)
+
+    return tuple(sorted(files)), tuple(scan_errors)
 
 
 def delete_files(mount_path: Path, file_paths: Iterable[str], execute: bool) -> dict[str, Any]:
@@ -454,18 +518,26 @@ def _load_settings(args: argparse.Namespace, shared: dict[str, Any] | None = Non
 def _load_g35_settings(args: argparse.Namespace, shared: dict[str, Any] | None = None) -> G35Settings:
     shared = _load_shared_config(args.config) if shared is None else shared
     mount_path = shared.get("mount_path")
+    data_sub_path = _normalize_data_sub_path(shared.get("data_sub_path", ""))
     cluster_id = str(shared.get("g35_cluster_id", "")).strip()
     osd_ids = shared.get("g35_osd_ids") or []
-    if not mount_path or not cluster_id or not isinstance(osd_ids, list) or not osd_ids:
-        raise ValueError("配置必须包含 mount_path、g35_cluster_id 和非空 g35_osd_ids")
+    if not mount_path or not data_sub_path or not cluster_id or not isinstance(osd_ids, list) or not osd_ids:
+        raise ValueError(
+            "配置必须包含 mount_path、data_sub_path、g35_cluster_id 和非空 g35_osd_ids"
+        )
     if any(not isinstance(osd_id, int) or osd_id < 0 or osd_id > 0xFFFFFFFF for osd_id in osd_ids):
         raise ValueError("g35_osd_ids 必须是无符号 32 位整数数组")
     if len(osd_ids) != len(set(osd_ids)):
         raise ValueError("g35_osd_ids 不能重复")
+    if Path(data_sub_path).is_absolute() or ".." in Path(data_sub_path).parts:
+        raise ValueError("data_sub_path 必须是相对 mount_path 的子路径，且不能包含 '..'")
     mount = Path(str(mount_path))
     if not mount.is_dir():
         raise ValueError(f"YRFS 挂载点不存在或不是目录: {mount}")
-    return G35Settings(mount, cluster_id, tuple(osd_ids))
+    data_path = mount / data_sub_path
+    if not data_path.is_dir():
+        raise ValueError(f"YRFS 数据目录不存在或不是目录: {data_path}")
+    return G35Settings(mount, data_sub_path, cluster_id, tuple(osd_ids))
 
 
 def _connect(settings: RedisSettings) -> Any:
@@ -587,14 +659,21 @@ def _handle_list_files(args: argparse.Namespace) -> int:
         files = load_manifest(args.manifest)
         report = {
             "mount_path": str(g35.mount_path),
+            "data_path": str(g35.data_path),
             "files": len(files),
-            "existing": sum((g35.mount_path / file).is_file() for file in files),
+            "existing": sum(_path_exists_tolerant(g35.mount_path / file) for file in files),
         }
     else:
         if args.osd_id not in g35.osd_ids:
             raise ValueError(f"OSD {args.osd_id} 不在 g35_osd_ids 中")
-        files = list_files(g35.mount_path, args.osd_id)
-        report = {"mount_path": str(g35.mount_path), "osd_id": args.osd_id, "files": list(files)}
+        files, scan_errors = list_files(g35, args.osd_id)
+        report = {
+            "mount_path": str(g35.mount_path),
+            "data_path": str(g35.data_path),
+            "osd_id": args.osd_id,
+            "files": list(files),
+            "scan_errors": list(scan_errors),
+        }
     _write_report(report, args.output)
     return 0
 
@@ -710,7 +789,9 @@ def _execute(args: argparse.Namespace) -> int:
         return _handle_delete_files(args, g35, file_paths, result)
     if args.osd_id not in g35.osd_ids:
         raise ValueError(f"OSD {args.osd_id} 不在 g35_osd_ids 中")
-    existing_files = sorted(file for file in file_paths if (g35.mount_path / file).exists())
+    existing_files = sorted(
+        file for file in file_paths if _path_exists_tolerant(g35.mount_path / file)
+    )
     return _handle_verify_recovery(args, g35, existing_files, result)
 
 
