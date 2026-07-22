@@ -12,12 +12,13 @@ g35_admin.py
 
 当 G3.5 的某个 OSD 故障或换盘后，需要清理所有落在该 OSD 上的旧缓存数据，避免 Redis 命中后读取到不存在或不可用的 YRFS 文件。本工具按安全顺序执行：
 
-1. 扫描挂载点，生成受影响文件清单。
-2. 查询 Redis 中指向这些文件的记录。
-3. 先删除 Redis 记录。
-4. 再删除 YRFS 数据文件。
-5. 重建或创建探活文件。
-6. 验证文件、Redis、探活文件和运行时检查状态。
+1. 扫描数据目录，生成受影响文件清单。
+2. 检查清单规模与文件是否仍存在。
+3. 查询 Redis 中指向这些文件的记录。
+4. 先删除 Redis 记录。
+5. 再删除 YRFS 数据文件。
+6. 重建或创建探活文件。
+7. 验证文件、Redis、探活文件和运行时检查状态。
 
 重要原则：必须先删 Redis 记录，再删数据文件。反向操作会产生“Redis 命中但文件已不存在”的窗口。
 
@@ -27,6 +28,7 @@ g35_admin.py
 
 ```bash
 python g35_admin.py --help
+python g35_admin.py <command> --help
 python g35_admin.py <command> [options]
 ```
 
@@ -42,12 +44,14 @@ python g35_admin.py <command> [options]
 pip install redis PyYAML
 ```
 
-探活文件校验和创建还需要运行环境中存在已编译的 `yrcache.c_ops`，并暴露以下能力：
+探活文件校验和创建还需要：
 
-- `_g35_query_yrfs_file_osds(path)`：查询 YRFS 文件实际分布在哪些 OSD 上。
-- `_g35_probe_payload(cluster_id, osd_id)`：生成探活文件内容。
+1. 已编译的 `yrcache.c_ops`，并暴露：
+   - `_g35_query_yrfs_file_osds(path)`：查询 YRFS 文件实际分布在哪些 OSD 上。
+   - `_g35_probe_payload(cluster_id, osd_id)`：生成探活文件内容。
+2. 可执行的 `yrcli`（`create-probes --execute` 会调用它创建带布局的文件）。
 
-`create-probes --dry-run` 不加载 `c_ops`，只预览路径；`--execute` 会调用 `yrcli --create` 建立 YRFS 布局，加载 `c_ops` 写入内容并校验。
+`create-probes --dry-run` 不加载 `c_ops`，只预览路径；`--execute` 会调用 `yrcli --create`，再加载 `c_ops` 写入内容并校验。
 
 ## 配置文件
 
@@ -72,11 +76,11 @@ shared_storage_cache_config:
 
 | 字段 | 必填 | 用途 |
 | --- | --- | --- |
-| `mount_path` | 是 | YRFS 挂载点。探活文件、删除路径校验都基于它。 |
+| `mount_path` | 是 | YRFS 挂载点。探活路径、删除路径校验都基于它。 |
 | `data_sub_path` | 是 | 相对 `mount_path` 的业务数据子目录。`list-files` 只扫描 `mount_path + data_sub_path`。 |
 | `g35_cluster_id` | 是 | G3.5 集群 ID，用于探活路径和探活内容。 |
 | `g35_osd_ids` | 是 | 当前集群有效 OSD ID 列表，必须是非重复无符号 32 位整数。 |
-| `redis_host` | Redis 命令必填 | Redis 地址。也可通过 `--redis-host` 覆盖。 |
+| `redis_host` | Redis 相关命令必填 | Redis 地址。也可通过 `--redis-host` 覆盖。 |
 | `redis_port` | 否 | Redis 端口，默认 `6379`。 |
 | `redis_db` | 否 | Redis DB，默认 `0`。 |
 | `redis_pin_key` | 否 | Redis pin zset key，默认 `share_fs_gc_zset`。 |
@@ -102,16 +106,43 @@ python g35_admin.py create-probes
 python g35_admin.py verify-recovery
 ```
 
-所有会改变数据的命令都支持 dry-run / execute 模式：
+### 通用约定
 
-- `--dry-run`：只预览，默认安全行为。
-- `--execute`：实际执行。
+- 会改变数据的命令支持 `--dry-run` / `--execute`：
+  - 不指定 `--execute` 时默认是 dry-run（只预览）。
+  - `--dry-run` 与 `--execute` 互斥。
+- 结果输出：
+  - `list-files`、`list-redis-records` 使用 `--output`。
+  - `delete-redis-records`、`delete-files`、`create-probes`、`verify-recovery` 使用 `--report`。
+  - **不指定 `--output` / `--report` 时，JSON 默认打印到终端标准输出（stdout），不会自动生成文件。**
+- `create-probes --verbose` 的分步日志打到 stderr，不与 JSON 混写。
+- 涉及 OSD 的参数统一支持 `--osd-id` 与 `--osd_id`：`list-files`、`create-probes`、`verify-recovery`。
+
+---
 
 ## 1. 生成受影响文件清单
 
+命令：`list-files --osd-id`
+
+扫描数据目录，找出文件名中包含目标 OSD 的业务数据文件，生成后续清理用的清单。
+
+### 1.1 配置示例
+
+```yaml
+shared_storage_cache_config:
+  mount_path: "/mnt/real-yrfs"
+  data_sub_path: "/yrcache_01"
+  g35_cluster_id: "wbz-test-cluster"
+  g35_osd_ids: [101, 102, 103, 104]
+```
+
+本功能需要：`mount_path`、`data_sub_path`、`g35_cluster_id`、`g35_osd_ids`。不需要 Redis 配置。
+
+### 1.2 执行方式
+
 ```bash
 export YRCACHE_CONFIG=/etc/yrcache/yrcache.yaml
-export FAILED_OSD=7
+export FAILED_OSD=306
 export WORK_DIR=/var/tmp/yrcache-g35-osd-${FAILED_OSD}
 mkdir -p "$WORK_DIR"
 
@@ -121,30 +152,39 @@ python g35_admin.py list-files \
   --output "$WORK_DIR/affected-files.json"
 ```
 
+参数说明：
+
+| 参数 | 必填 | 作用 / 不给会怎样 |
+| --- | --- | --- |
+| `--config` | 是 | YAML 配置文件。不给会报参数错误。 |
+| `--osd-id` / `--osd_id` | 是（与 `--manifest` 二选一） | 按该 OSD 扫描数据目录。不在 `g35_osd_ids` 中会报错。本模式不要同时给 `--manifest`。 |
+| `--output` | 否 | 写入 JSON 文件；**不给则打印到终端**。 |
+| `--summary` | 否 | 只能与 `--manifest` 一起用；本模式（`--osd-id`）若指定会报错。 |
+| `--manifest` | 否 | 本模式不要用；给了就变成“检查清单”而不是“生成清单”。 |
+
 扫描逻辑：
 
-- 只递归扫描数据目录 `mount_path + data_sub_path`，例如 `/mnt/real-yrfs/yrcache_01`。
-- 不扫描探活目录 `.yrcache_g35_probes/` 等挂载点下的其他路径。
-- 精确解析文件名中最后一个 `_osds_` 后面的 OSD ID 列表。
-- OSD ID 列表格式为十进制整数，多个 OSD 用 `-` 分隔，例如 `_osds_101-102-103.dat`。
-- 不使用 `*7*` 这类模糊匹配，所以不会把 `17`、`70`、`107` 误判成 `7`。
-- 对故障 OSD 文件，`stat`/`is_file` 可能返回 I/O error；此时仍按文件名匹配并收录，同时把错误记入 `scan_errors`，不会中断整次扫描。
-- 清单中的路径仍相对 `mount_path`，例如 `yrcache_01/worker_id_1/cache_a_osds_7-8.dat`。
+- 只扫 `mount_path + data_sub_path`，例如 `/mnt/real-yrfs/yrcache_01`。
+- 不扫探活目录 `.yrcache_g35_probes/`。
+- 解析文件名最后一个 `_osds_` 后的 OSD 列表，例如 `_osds_101-102-103.dat`。
+- 精确匹配整数，不会把 `17`/`70`/`107` 误判成 `7`。
+- 故障 OSD 上 `stat` 可能 EIO：仍按文件名匹配并收录，错误记入 `scan_errors`，扫描不中断。
+- 清单路径相对 `mount_path`，例如 `yrcache_01/worker_id_1/cache_a_osds_306-xxx.dat`。
 
-输出示例：
+### 1.3 产出报告
 
 ```json
 {
   "mount_path": "/mnt/real-yrfs",
   "data_path": "/mnt/real-yrfs/yrcache_01",
-  "osd_id": 7,
+  "osd_id": 306,
   "files": [
-    "yrcache_01/worker_id_1/cache_a_osds_7-8.dat",
-    "yrcache_01/worker_id_2/cache_b_osds_3-7.dat"
+    "yrcache_01/worker_id_1/cache_a_osds_306-307.dat",
+    "yrcache_01/worker_id_2/cache_b_osds_305-306.dat"
   ],
   "scan_errors": [
     {
-      "path": "yrcache_01/worker_id_1/cache_a_osds_7-8.dat",
+      "path": "yrcache_01/worker_id_1/cache_a_osds_306-307.dat",
       "error": "OSError: [Errno 5] Input/output error",
       "phase": "stat"
     }
@@ -152,42 +192,170 @@ python g35_admin.py list-files \
 }
 ```
 
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `mount_path` | YRFS 挂载点。 |
+| `data_path` | 实际扫描的数据目录。 |
+| `osd_id` | 本次扫描的目标 OSD。 |
+| `files` | 受影响文件相对路径列表（相对 `mount_path`）。 |
+| `scan_errors` | 扫描中的 I/O / scandir 错误；可能为空数组。 |
+| `scan_errors[].path` | 出错路径（相对 `mount_path`）。 |
+| `scan_errors[].error` | 错误信息。 |
+| `scan_errors[].phase` | `stat`：对条目做 is_file/is_dir 失败；`scandir`：列目录失败。 |
+
+该报告没有 `status` 字段；文件要么出现在 `files` 中，要么因文件名不匹配而不收录。
+
+---
+
 ## 2. 检查受影响文件清单
+
+命令：`list-files --manifest`
+
+对已有清单做存在性检查。
+
+- **不加 `--summary`**：输出每个文件的 `existing` / `missing` 明细。
+- **加 `--summary`**：只输出文件总数和仍存在数。
+
+### 2.1 配置示例
+
+与第 1 节相同，需要 `mount_path`、`data_sub_path`、`g35_cluster_id`、`g35_osd_ids`。
+
+### 2.2 执行方式
+
+明细检查（默认）：
 
 ```bash
 python g35_admin.py list-files \
   --config "$YRCACHE_CONFIG" \
   --manifest "$WORK_DIR/affected-files.json" \
-  --summary
+  --output "$WORK_DIR/affected-files-check.json"
 ```
 
-当前 `--summary` 表示按清单做摘要检查，输出包括：
+只看摘要：
+
+```bash
+python g35_admin.py list-files \
+  --config "$YRCACHE_CONFIG" \
+  --manifest "$WORK_DIR/affected-files.json" \
+  --summary \
+  --output "$WORK_DIR/affected-files-summary.json"
+```
+
+参数说明：
+
+| 参数 | 必填 | 作用 / 不给会怎样 |
+| --- | --- | --- |
+| `--config` | 是 | YAML 配置文件。 |
+| `--manifest` | 是（与 `--osd-id` 二选一） | 已有清单。支持：① JSON 数组；② 含 `files` 字段的对象（第 1 节输出）。 |
+| `--summary` | 否 | 只输出摘要计数。不给则输出每个文件的存在状态明细。不能与 `--osd-id` 同用。 |
+| `--output` | 否 | 写入 JSON 文件；**不给则打印到终端**。 |
+| `--osd-id` | 否 | 本模式不要用；给了就变成生成清单。 |
+
+存在性检查对 I/O error 做了容错：访问失败视为文件仍存在（故障 OSD 上常见）。
+
+### 2.3 产出报告
+
+不加 `--summary`（明细）：
 
 ```json
 {
   "mount_path": "/mnt/real-yrfs",
   "data_path": "/mnt/real-yrfs/yrcache_01",
   "files": 2,
-  "existing": 2
+  "existing": 1,
+  "missing": 1,
+  "details": [
+    {
+      "file": "yrcache_01/worker_id_1/cache_a_osds_306-307.dat",
+      "status": "existing"
+    },
+    {
+      "file": "yrcache_01/worker_id_2/cache_b_osds_305-306.dat",
+      "status": "missing"
+    }
+  ]
+}
+```
+
+加 `--summary`（摘要）：
+
+```json
+{
+  "mount_path": "/mnt/real-yrfs",
+  "data_path": "/mnt/real-yrfs/yrcache_01",
+  "files": 2,
+  "existing": 1
 }
 ```
 
 字段说明：
 
-- `files`：清单中的文件数量。
-- `existing`：当前仍存在于 `mount_path` 下的文件数量。访问返回 I/O error 的路径也计为存在。
+| 字段 | 含义 |
+| --- | --- |
+| `mount_path` | YRFS 挂载点。 |
+| `data_path` | 数据目录。 |
+| `files` | 清单中的文件数量。 |
+| `existing` | 当前仍存在的数量；I/O error 也计为存在。 |
+| `missing` | 已不存在的数量；仅明细模式输出。 |
+| `details` | 每个文件的检查结果；仅明细模式输出。 |
 
-清单可以是 JSON 数组：
+`details[].status`：
+
+| status | 含义 |
+| --- | --- |
+| `existing` | 文件仍存在（含 I/O error 视为存在）。 |
+| `missing` | 文件已不存在。 |
+
+清理完成后期望：`existing` 为 `0`，明细中全部为 `missing`。
+
+清单格式示例：
 
 ```json
 [
-  "yrcache_01/worker_id_1/cache_a_osds_7-8.dat"
+  "yrcache_01/worker_id_1/cache_a_osds_306-307.dat"
 ]
 ```
 
-也可以是包含 `files` 字段的对象，也就是 `list-files --osd-id` 的原始输出格式。
+或：
+
+```json
+{
+  "files": [
+    "yrcache_01/worker_id_1/cache_a_osds_306-307.dat"
+  ]
+}
+```
+
+---
 
 ## 3. 查询 Redis 记录
+
+命令：`list-redis-records`
+
+扫描 Redis，找出 `location.file_path` 指向清单中文件的 YRCache 记录。
+
+### 3.1 配置示例
+
+```yaml
+shared_storage_cache_config:
+  mount_path: "/mnt/real-yrfs"
+  data_sub_path: "/yrcache_01"
+  g35_cluster_id: "wbz-test-cluster"
+  g35_osd_ids: [101, 102, 103, 104]
+
+  redis_host: "127.0.0.1"
+  redis_port: 6379
+  redis_db: 0
+  redis_pin_key: "share_fs_gc_zset"
+  redis_connect_timeout_ms: 1000
+  redis_socket_timeout_ms: 3000
+```
+
+本功能至少需要能连上 Redis：`redis_host`（配置或 `--redis-host`），以及可选的 port/db/password/pin_key。
+
+### 3.2 执行方式
 
 ```bash
 python g35_admin.py list-redis-records \
@@ -195,31 +363,6 @@ python g35_admin.py list-redis-records \
   --manifest "$WORK_DIR/affected-files.json" \
   --scan-batch 1000 \
   --output "$WORK_DIR/affected-redis-records.json"
-```
-
-实现细节：
-
-- 使用 Redis `SCAN` 分批遍历，不使用 `KEYS *`。
-- 只处理看起来像 YRCache 记录的 string key。
-- 反序列化 string value 中的 SharedValueMeta。
-- 只保留 `location.file_path` 指向清单中文件的记录。
-
-输出示例：
-
-```json
-{
-  "scanned_keys": 12876,
-  "matched": 2,
-  "records": [
-    {
-      "key": "1:2:3:abc:def",
-      "file_path": "yrcache_01/worker_id_1/cache_a_osds_7-8.dat",
-      "offset": 0,
-      "real_size": 4096,
-      "alloc_size": 4096
-    }
-  ]
-}
 ```
 
 只看数量：
@@ -231,9 +374,86 @@ python g35_admin.py list-redis-records \
   --count-only
 ```
 
+参数说明：
+
+| 参数 | 必填 | 作用 / 不给会怎样 |
+| --- | --- | --- |
+| `--manifest` | 是 | 受影响文件清单。不给会报参数错误。 |
+| `--config` | 建议 | 从中读 Redis 连接信息。若不用 config，必须用 `--redis-host` 等补齐。 |
+| `--redis-host` | 条件必填 | 覆盖/提供 Redis 地址。config 和本参数都没有时会报错。 |
+| `--redis-port` | 否 | 覆盖端口；默认配置值或 `6379`。 |
+| `--redis-db` | 否 | 覆盖 DB；默认配置值或 `0`。 |
+| `--redis-password` | 否 | Redis 密码；优先于 `YRCACHE_REDIS_PASSWORD`。不给则用环境变量或无密码。 |
+| `--redis-pin-key` | 否 | 覆盖 pin zset key；默认配置值或 `share_fs_gc_zset`。查询阶段不删 pin，但设置仍会加载。 |
+| `--scan-batch` | 否 | Redis `SCAN` 的 `COUNT` 提示，默认 `1000`。越小越平滑，越大单次压力更大。 |
+| `--count-only` | 否 | 只输出 `scanned_keys`/`matched`，不含 `records`。不给则输出完整明细。 |
+| `--output` | 否 | 写入 JSON 文件；**不给则打印到终端**。 |
+
+实现细节：
+
+- 使用 `SCAN`，不用 `KEYS *`。
+- 只处理看起来像 YRCache 的 string key。
+- 反序列化 SharedValueMeta，保留 `file_path` 落在清单中的记录。
+
+### 3.3 产出报告
+
+完整输出：
+
+```json
+{
+  "scanned_keys": 12876,
+  "matched": 2,
+  "records": [
+    {
+      "key": "1:2:3:abc:def",
+      "file_path": "yrcache_01/worker_id_1/cache_a_osds_306-307.dat",
+      "offset": 0,
+      "real_size": 4096,
+      "alloc_size": 4096
+    }
+  ]
+}
+```
+
+`--count-only` 输出：
+
+```json
+{
+  "scanned_keys": 12876,
+  "matched": 2
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `scanned_keys` | SCAN 过程中见到的 key 总数（含未匹配）。 |
+| `matched` | 命中清单文件的记录数。 |
+| `records` | 明细；`--count-only` 时不出现。 |
+| `records[].key` | Redis key。 |
+| `records[].file_path` | SharedValueMeta 中的文件路径（相对 `mount_path`）。 |
+| `records[].offset` | 文件内偏移。 |
+| `records[].real_size` | 实际数据大小。 |
+| `records[].alloc_size` | 分配大小。 |
+
+清理 Redis 后期望：`matched` 为 `0`。
+
+---
+
 ## 4. 删除 Redis 记录
 
-先预演：
+命令：`delete-redis-records`
+
+先扫描命中清单的 Redis 记录，再按条件删除（value 未变才删，并 `ZREM` pin zset）。
+
+### 4.1 配置示例
+
+与第 3 节相同，需要 Redis 连接信息。
+
+### 4.2 执行方式
+
+预演（推荐先做）：
 
 ```bash
 python g35_admin.py delete-redis-records \
@@ -243,7 +463,7 @@ python g35_admin.py delete-redis-records \
   --report "$WORK_DIR/redis-delete-dry-run.json"
 ```
 
-确认预演数量和查询结果一致后执行：
+实际删除：
 
 ```bash
 python g35_admin.py delete-redis-records \
@@ -253,32 +473,112 @@ python g35_admin.py delete-redis-records \
   --report "$WORK_DIR/redis-delete-report.json"
 ```
 
-删除逻辑使用 Lua 条件删除：
+参数说明：
 
-- 当前 key 的 value 和扫描时记录的 value 完全一致才删除。
-- 同时从 `redis_pin_key` 指定的 zset 中 `ZREM`。
-- 如果 value 已变或 key 已不存在，则不删除，并标记为 `changed_or_missing`。
+| 参数 | 必填 | 作用 / 不给会怎样 |
+| --- | --- | --- |
+| `--manifest` | 是 | 受影响文件清单。 |
+| `--config` | 建议 | 读 Redis 连接；也可用 `--redis-host` 等覆盖。 |
+| `--redis-host` / `--redis-port` / `--redis-db` / `--redis-password` / `--redis-pin-key` | 否 | 覆盖 Redis 连接与 pin key。无 host 时会报错。 |
+| `--scan-batch` | 否 | `SCAN COUNT`，默认 `1000`。 |
+| `--dry-run` | 否 | 只预览，不删除。不指定 `--execute` 时默认就是 dry-run。 |
+| `--execute` | 否 | 实际条件删除。与 `--dry-run` 互斥。 |
+| `--report` | 否 | 写入 JSON 报告；**不给则打印到终端**。 |
 
-Redis 删除状态：
+说明：`--dry-run` 与 `list-redis-records` 底层扫描相同，命中集合一致；差异是字段名（`would_delete` vs `matched`），且前者可继续 `--execute`。
+
+删除逻辑（Lua）：
+
+- 仅当当前 value 与扫描时完全一致才 `DEL`。
+- 同时从 `redis_pin_key` 做 `ZREM`。
+- value 已变或 key 已不存在 → `changed_or_missing`，不强删。
+
+### 4.3 产出报告
+
+dry-run：
+
+```json
+{
+  "mode": "dry-run",
+  "scanned_keys": 12876,
+  "would_delete": 2,
+  "records": [
+    {
+      "key": "1:2:3:abc:def",
+      "file_path": "yrcache_01/worker_id_1/cache_a_osds_306-307.dat",
+      "offset": 0,
+      "real_size": 4096,
+      "alloc_size": 4096
+    }
+  ]
+}
+```
+
+execute：
+
+```json
+{
+  "mode": "execute",
+  "scanned_keys": 12876,
+  "matched": 2,
+  "deleted": 2,
+  "changed_or_missing": 0,
+  "records": [
+    {
+      "key": "1:2:3:abc:def",
+      "status": "deleted"
+    }
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 出现时机 | 含义 |
+| --- | --- | --- |
+| `mode` | 总是 | `dry-run` 或 `execute`。 |
+| `scanned_keys` | 总是 | SCAN 见到的 key 数。 |
+| `would_delete` | dry-run | 预览将删除的记录数。 |
+| `matched` | execute | 扫描命中、准备删除的记录数。 |
+| `deleted` | execute | 实际删除成功数。 |
+| `changed_or_missing` | execute | 因 value 变化或不存在而未删的数量。 |
+| `records` | 总是 | dry-run 为完整记录明细；execute 为每条 key 的删除结果。 |
+
+execute 时 `records[].status`：
 
 | status | 含义 |
 | --- | --- |
-| `deleted` | key 的 value 未变化，已成功删除，并从 pin zset 移除。 |
-| `changed_or_missing` | key 不存在或 value 已变化。工具不会强删，避免误删新写入记录。 |
+| `deleted` | value 未变，已删除，并从 pin zset 移除。 |
+| `changed_or_missing` | key 不存在或 value 已变，未删除。 |
 
-再次确认 Redis 引用为 0：
+删除后再跑一次 `list-redis-records --count-only`，确认 `matched` 为 `0`。
 
-```bash
-python g35_admin.py list-redis-records \
-  --config "$YRCACHE_CONFIG" \
-  --manifest "$WORK_DIR/affected-files.json" \
-  --scan-batch 1000 \
-  --count-only
-```
+---
 
 ## 5. 删除 YRFS 数据文件
 
-先预演：
+命令：`delete-files`
+
+按清单删除 YRFS 上的业务数据文件。`--execute` 时强制要求 Redis 已无引用。
+
+### 5.1 配置示例
+
+```yaml
+shared_storage_cache_config:
+  mount_path: "/mnt/real-yrfs"
+  data_sub_path: "/yrcache_01"
+  g35_cluster_id: "wbz-test-cluster"
+  g35_osd_ids: [101, 102, 103, 104]
+
+  redis_host: "127.0.0.1"
+  redis_port: 6379
+```
+
+需要 `mount_path` 等 G35 字段；`--execute` 且带 `--require-no-redis-references` 时还需要能连 Redis。
+
+### 5.2 执行方式
+
+预演：
 
 ```bash
 python g35_admin.py delete-files \
@@ -288,7 +588,7 @@ python g35_admin.py delete-files \
   --report "$WORK_DIR/file-delete-dry-run.json"
 ```
 
-确认 Redis 查询结果为 0 后执行：
+实际删除：
 
 ```bash
 python g35_admin.py delete-files \
@@ -299,81 +599,79 @@ python g35_admin.py delete-files \
   --report "$WORK_DIR/file-delete-report.json"
 ```
 
+参数说明：
+
+| 参数 | 必填 | 作用 / 不给会怎样 |
+| --- | --- | --- |
+| `--config` | 是 | YAML 配置。 |
+| `--manifest` | 是 | 受影响文件清单；路径必须相对 `mount_path`，禁止绝对路径和 `../`。 |
+| `--dry-run` | 否 | 只预览；不指定 `--execute` 时默认 dry-run。dry-run 可不查 Redis。 |
+| `--execute` | 否 | 实际删除。必须同时给 `--require-no-redis-references`，否则报错。 |
+| `--require-no-redis-references` | `--execute` 时必填 | 先扫 Redis；若仍有引用则拒绝删除。dry-run 可不给。 |
+| `--scan-batch` | 否 | 检查 Redis 时的 `SCAN COUNT`，默认 `1000`。 |
+| `--redis-password` | 否 | Redis 密码。需要查 Redis 时才用到。 |
+| `--report` | 否 | 写入 JSON 报告；**不给则打印到终端**。 |
+
 安全约束：
 
-- `--execute` 时必须指定 `--require-no-redis-references`。
-- 如果仍有 Redis 记录引用清单中文件，命令拒绝删除。
-- manifest 中只能包含相对路径。
-- 禁止路径越过 `mount_path`，例如 `../xxx` 会被拒绝。
-- 只删除普通文件。
+- 先删 Redis，再删文件。
+- 只删普通文件。
+- 路径必须落在 `mount_path` 下。
 
-文件删除状态：
+### 5.3 产出报告
+
+```json
+{
+  "mode": "dry-run",
+  "matched": 2,
+  "deleted": 0,
+  "missing": 0,
+  "files": [
+    {
+      "file": "yrcache_01/worker_id_1/cache_a_osds_306-307.dat",
+      "status": "would_delete"
+    },
+    {
+      "file": "yrcache_01/worker_id_2/cache_b_osds_305-306.dat",
+      "status": "would_delete"
+    }
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `mode` | `dry-run` 或 `execute`。 |
+| `matched` | 清单中的文件条目数。 |
+| `deleted` | execute 时实际删除数；dry-run 为 `0`。 |
+| `missing` | 本来就不存在的数量。 |
+| `files` | 每个文件的处理结果。 |
+
+`files[].status`：
 
 | status | 含义 |
 | --- | --- |
-| `would_delete` | dry-run 中发现文件存在，执行时会删除。 |
-| `deleted` | execute 中文件已删除。 |
+| `would_delete` | dry-run：文件存在，执行时会删。 |
+| `deleted` | execute：已删除。 |
 | `missing` | 文件本来就不存在。 |
+
+---
 
 ## 6. 创建探活文件
 
-为配置中的每个 OSD 创建一个探活文件：
+命令：`create-probes`
 
-```bash
-python g35_admin.py create-probes \
-  --config "$YRCACHE_CONFIG" \
-  --dry-run
-```
+为 OSD 创建探活文件：先用 `yrcli --create ... --owners=<osd_id>` 建布局，再写入 `_g35_probe_payload`，最后校验布局与内容。
 
-实际创建：
-
-```bash
-python g35_admin.py create-probes \
-  --config "$YRCACHE_CONFIG" \
-  --execute \
-  --verbose \
-  --report "$WORK_DIR/create-probes-report.json"
-```
-
-覆盖已有探活文件：
-
-```bash
-python g35_admin.py create-probes \
-  --config "$YRCACHE_CONFIG" \
-  --execute \
-  --overwrite \
-  --verbose \
-  --report "$WORK_DIR/create-probes-report.json"
-```
-
-只重建指定的一个或多个 OSD：
-
-```bash
-# 单个 OSD
-python g35_admin.py create-probes \
-  --config "$YRCACHE_CONFIG" \
-  --osd-id 101 \
-  --execute --overwrite --verbose
-
-# 多个 OSD
-python g35_admin.py create-probes \
-  --config "$YRCACHE_CONFIG" \
-  --osd-id 101 103 104 \
-  --execute --overwrite --verbose
-```
-
-`--osd-id`（也兼容 `--osd_id`）后可跟一个或多个 ID；不提供时处理配置
-`g35_osd_ids` 中的全部 OSD。指定的 ID 必须存在于配置中，且不能重复。
-
-`--verbose` 会把每个 OSD 的分步日志打到 stderr（生成 payload → `yrcli --create` → 写入内容 → 校验），失败时会带上 `yrcli` 的 stdout/stderr，便于定位后手动复现。
-
-路径格式：
+探活路径：
 
 ```text
 {mount_path}/.yrcache_g35_probes/{g35_cluster_id}/probe_osd_{osd_id}.dat
 ```
 
-配置示例：
+### 6.1 配置示例
 
 ```yaml
 shared_storage_cache_config:
@@ -383,49 +681,62 @@ shared_storage_cache_config:
   g35_osd_ids: [101, 102, 103, 104]
 ```
 
-执行后会创建：
+需要 G35 字段；`--execute` 还需要 `yrcli` 与 `yrcache.c_ops`。`--dry-run` 不需要 `c_ops`。
 
-```text
-/mnt/real-yrfs/.yrcache_g35_probes/wbz-test-cluster/probe_osd_101.dat
-/mnt/real-yrfs/.yrcache_g35_probes/wbz-test-cluster/probe_osd_102.dat
-/mnt/real-yrfs/.yrcache_g35_probes/wbz-test-cluster/probe_osd_103.dat
-/mnt/real-yrfs/.yrcache_g35_probes/wbz-test-cluster/probe_osd_104.dat
+### 6.2 执行方式
+
+预览：
+
+```bash
+python g35_admin.py create-probes \
+  --config "$YRCACHE_CONFIG" \
+  --dry-run
 ```
 
-内容说明：
+创建全部 OSD：
 
-- 文件不是空文件。
-- 内容由 `_g35_probe_payload(g35_cluster_id, osd_id)` 生成。
-- 该 payload 和 `verify_probe` 后续校验使用的是同一套逻辑。
-- 创建时先调用 `yrcli --create --stripesize=1m --stripecount=1 --pool=default <path> --owners=<osd_id>` 建立 YRFS 布局，再写入 payload。
-- 覆盖已有探活文件时会先删除旧文件，再重新执行 `yrcli --create`。
-- 写完后立即调用 `verify_probe`，校验文件布局和内容。
+```bash
+python g35_admin.py create-probes \
+  --config "$YRCACHE_CONFIG" \
+  --execute \
+  --verbose \
+  --report "$WORK_DIR/create-probes-report.json"
+```
 
-注意：运行环境中需要能直接执行 `yrcli`。如果 `yrcli` 创建失败，报告会显示 `yrcli_error`；如果布局未落在唯一目标 OSD，报告会显示 `created_but_wrong_layout`。
+覆盖已有文件：
 
-### create-probes 状态说明
+```bash
+python g35_admin.py create-probes \
+  --config "$YRCACHE_CONFIG" \
+  --execute \
+  --overwrite \
+  --verbose
+```
 
-dry-run 状态：
+只处理指定 OSD（一个或多个）：
 
-| status | 含义 |
-| --- | --- |
-| `would_create` | 目标探活文件不存在，执行时会创建。 |
-| `would_overwrite` | 目标探活文件已存在，且指定了 `--overwrite`，执行时会覆盖。 |
-| `would_skip_exists` | 目标探活文件已存在，未指定 `--overwrite`，执行时会跳过。 |
+```bash
+python g35_admin.py create-probes \
+  --config "$YRCACHE_CONFIG" \
+  --osd-id 101 103 \
+  --execute --overwrite --verbose
+```
 
-execute 状态：
+参数说明：
 
-| status | 含义 |
-| --- | --- |
-| `created` | 已写入探活文件，并且布局和内容校验通过。 |
-| `skipped_exists` | 文件已存在，未指定 `--overwrite`，跳过未改。 |
-| `yrcli_error` | `yrcli --create` 执行失败。报告中会带 `error`。 |
-| `created_but_layout_error` | 文件已写入，但查询 YRFS 布局失败。报告中会带 `error_code`。 |
-| `created_but_wrong_layout` | 文件已写入，但实际布局不是只落在目标 OSD。报告中会带 `actual_osds`。 |
-| `created_but_read_error` | 文件已写入，但回读文件失败。报告中会带 `error`。 |
-| `created_but_content_error` | 文件已写入，但内容与 `_g35_probe_payload` 期望值不一致。 |
+| 参数 | 必填 | 作用 / 不给会怎样 |
+| --- | --- | --- |
+| `--config` | 是 | YAML 配置。 |
+| `--osd-id` / `--osd_id` | 否 | 后跟一个或多个 ID。不给则处理 `g35_osd_ids` 全部。ID 必须在配置中且不能重复。 |
+| `--overwrite` | 否 | 已存在时先 `unlink` 再 `yrcli --create` 重建。不给则跳过已存在文件。 |
+| `--verbose` | 否 | 分步日志打到 stderr。不给则只有 JSON 结果。 |
+| `--dry-run` | 否 | 只预览；不指定 `--execute` 时默认 dry-run。 |
+| `--execute` | 否 | 实际创建并校验。需要 `yrcli` 与 `c_ops`。 |
+| `--report` | 否 | 写入 JSON 报告；**不给则打印到终端**。 |
 
-成功报告示例：
+`--overwrite` 是“删旧再建”，不是只覆盖内容；布局由 `yrcli --create --stripesize=1m --stripecount=1 --pool=default --owners=<osd_id>` 决定。
+
+### 6.3 产出报告
 
 ```json
 {
@@ -447,7 +758,63 @@ execute 状态：
 }
 ```
 
+顶层字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `mode` | `dry-run` 或 `execute`。 |
+| `cluster_id` | `g35_cluster_id`。 |
+| `mount_path` | 挂载点。 |
+| `matched` | 本次处理的 OSD 数。 |
+| `created` | execute 下尝试创建/覆盖的数量（含失败项）；dry-run 为 `0`。 |
+| `skipped` | 因已存在且未 `--overwrite` 而跳过的数量。 |
+| `probes` | 每个 OSD 的明细。 |
+
+`probes[].status`（dry-run）：
+
+| status | 含义 |
+| --- | --- |
+| `would_create` | 文件不存在，执行时会创建。 |
+| `would_overwrite` | 文件已存在且指定了 `--overwrite`，执行时会覆盖。 |
+| `would_skip_exists` | 文件已存在且未指定 `--overwrite`，执行时会跳过。 |
+
+`probes[].status`（execute）：
+
+| status | 含义 |
+| --- | --- |
+| `created` | 写入成功，且布局/内容校验通过（`verify=ok`）。 |
+| `skipped_exists` | 已存在且未 `--overwrite`，跳过。 |
+| `yrcli_error` | `yrcli --create` 失败；带 `error`。 |
+| `created_but_layout_error` | 已写入，但查布局失败；带 `error_code`。 |
+| `created_but_wrong_layout` | 已写入，但实际 OSD 不是 `[目标osd]`；带 `actual_osds`。 |
+| `created_but_read_error` | 已写入，但回读失败；带 `error`。 |
+| `created_but_content_error` | 已写入，但内容与 payload 不一致。 |
+
+常见附加字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `bytes` | 写入字节数。 |
+| `verify` | 校验子状态：`ok` / `layout_error` / `wrong_layout` / `read_error` / `content_error`。 |
+| `error` | 失败原因。 |
+| `error_code` | 布局查询错误码。 |
+| `actual_osds` | 实际布局 OSD 列表。 |
+
+期望：全部 `status=created` 且 `verify=ok`。`created_but_wrong_layout` 不建议忽略。
+
+---
+
 ## 7. 验证恢复
+
+命令：`verify-recovery`
+
+检查清理是否完成、探活是否合格，并要求人工确认运行时条件。
+
+### 7.1 配置示例
+
+与第 3 节相同，需要 G35 字段 + Redis 连接；探活校验需要 `yrcache.c_ops`。
+
+### 7.2 执行方式
 
 ```bash
 python g35_admin.py verify-recovery \
@@ -458,56 +825,107 @@ python g35_admin.py verify-recovery \
   --report "$WORK_DIR/verify-recovery-report.json"
 ```
 
-静态检查包括：
+参数说明：
 
-- manifest 中的受影响文件全部不存在。
-- Redis 中不存在指向这些文件的记录。
-- 配置中的所有 OSD 探活文件都存在、布局正确、内容校验通过。
+| 参数 | 必填 | 作用 / 不给会怎样 |
+| --- | --- | --- |
+| `--config` | 是 | YAML 配置。 |
+| `--osd-id` / `--osd_id` | 是 | 本次故障/恢复的目标 OSD；必须在 `g35_osd_ids` 中。注意：探活校验仍会检查配置中**全部** OSD。 |
+| `--manifest` | 是 | 受影响文件清单。 |
+| `--scan-batch` | 否 | Redis `SCAN COUNT`，默认 `1000`。 |
+| `--redis-password` | 否 | Redis 密码。 |
+| `--ack-runtime-checks` | 否 | 确认已完成运行时人工检查。**不给时即使静态检查全过，退出码也是 `2`，且 `ok=false`。** |
+| `--report` | 否 | 写入 JSON 报告；**不给则打印到终端**。 |
 
-运行时检查需要人工确认：
+静态检查：
 
-- 各 YRCache 实例已经移除目标 OSD 的异常标记。
-- 文件访问模式进入 `CLOSED`，或因其他异常 OSD 保持符合预期的 `DEGRADED`。
-- 原受影响 KV Cache 查询返回缓存未命中，并可重新计算。
+- manifest 中文件全部不存在（I/O error 仍视为存在）。
+- Redis 无指向这些文件的记录。
+- 配置中所有 OSD 的探活文件 `status=ok`。
 
-未指定 `--ack-runtime-checks` 时，即使静态检查全部通过，命令也会返回未完成状态，退出码为 `2`。
+运行时需人工确认（`--ack-runtime-checks`）：
 
-### verify_probe 状态说明
+- 各实例已移除目标 OSD 异常标记。
+- 访问模式为 `CLOSED`，或因其他异常保持预期 `DEGRADED`。
+- 原受影响 KV Cache 未命中且可重算。
 
-`verify-recovery` 的 `probes` 字段来自单个探活文件校验：
+### 7.3 产出报告
+
+```json
+{
+  "ok": true,
+  "static_checks_ok": true,
+  "runtime_checks_acknowledged": true,
+  "remaining_files": [],
+  "remaining_redis_records": [],
+  "probes": [
+    {
+      "osd_id": 101,
+      "path": "/mnt/real-yrfs/.yrcache_g35_probes/wbz-test-cluster/probe_osd_101.dat",
+      "status": "ok"
+    }
+  ],
+  "runtime_checks_required": [
+    "确认各 YRCache 实例已经移除目标 OSD 的异常标记",
+    "确认文件访问模式为 CLOSED，或因其他异常 OSD 保持 DEGRADED",
+    "确认原受影响 KV Cache 查询返回未命中并可重新计算"
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `ok` | 整体是否通过：`static_checks_ok && runtime_checks_acknowledged`。 |
+| `static_checks_ok` | 文件/Redis/探活静态检查是否全过。 |
+| `runtime_checks_acknowledged` | 是否传了 `--ack-runtime-checks`。 |
+| `remaining_files` | 清单中仍存在的文件。期望 `[]`。 |
+| `remaining_redis_records` | 仍引用清单文件的 Redis 记录。期望 `[]`。 |
+| `probes` | 每个 OSD 的探活校验结果。 |
+| `runtime_checks_required` | 需要人工确认的运行时检查项。 |
+
+`probes[].status`：
 
 | status | 含义 |
 | --- | --- |
-| `ok` | 文件布局只包含目标 OSD，且内容完全符合预期。 |
-| `layout_error` | 查询 YRFS 布局失败。报告中会带 `error_code`。 |
-| `wrong_layout` | 查询成功，但实际 OSD 列表不是 `[osd_id]`。报告中会带 `actual_osds`。 |
-| `read_error` | 文件布局正常，但读取文件内容失败。报告中会带 `error`。 |
-| `content_error` | 文件可读，但内容与 `_g35_probe_payload` 生成值不一致。 |
+| `ok` | 布局仅为目标 OSD，且内容符合 payload。 |
+| `layout_error` | 查布局失败；带 `error_code`。 |
+| `wrong_layout` | 实际 OSD 不是 `[osd_id]`；带 `actual_osds`。 |
+| `read_error` | 布局正常但读内容失败；带 `error`。 |
+| `content_error` | 内容与 `_g35_probe_payload` 不一致。 |
+
+退出码：`ok=true` 返回 `0`，否则返回 `2`（参数/依赖错误仍为 `1`）。
+
+---
 
 ## 推荐完整流程
 
 ```bash
 export YRCACHE_CONFIG=/etc/yrcache/yrcache.yaml
-export FAILED_OSD=7
+export FAILED_OSD=306
 export WORK_DIR=/var/tmp/yrcache-g35-osd-${FAILED_OSD}
 mkdir -p "$WORK_DIR"
 
+# 1. 生成清单
 python g35_admin.py list-files \
   --config "$YRCACHE_CONFIG" \
   --osd-id "$FAILED_OSD" \
   --output "$WORK_DIR/affected-files.json"
 
+# 2. 检查清单规模
 python g35_admin.py list-files \
   --config "$YRCACHE_CONFIG" \
   --manifest "$WORK_DIR/affected-files.json" \
   --summary
 
+# 3. 查询 Redis（也可用 delete-redis-records --dry-run 做预览）
 python g35_admin.py list-redis-records \
   --config "$YRCACHE_CONFIG" \
   --manifest "$WORK_DIR/affected-files.json" \
-  --scan-batch 1000 \
-  --output "$WORK_DIR/affected-redis-records.json"
+  --count-only
 
+# 4. 删除 Redis
 python g35_admin.py delete-redis-records \
   --config "$YRCACHE_CONFIG" \
   --manifest "$WORK_DIR/affected-files.json" \
@@ -522,9 +940,9 @@ python g35_admin.py delete-redis-records \
 python g35_admin.py list-redis-records \
   --config "$YRCACHE_CONFIG" \
   --manifest "$WORK_DIR/affected-files.json" \
-  --scan-batch 1000 \
   --count-only
 
+# 5. 删除文件
 python g35_admin.py delete-files \
   --config "$YRCACHE_CONFIG" \
   --manifest "$WORK_DIR/affected-files.json" \
@@ -537,12 +955,15 @@ python g35_admin.py delete-files \
   --execute \
   --report "$WORK_DIR/file-delete-report.json"
 
+# 6. 创建探活
 python g35_admin.py create-probes \
   --config "$YRCACHE_CONFIG" \
   --execute \
   --overwrite \
+  --verbose \
   --report "$WORK_DIR/create-probes-report.json"
 
+# 7. 验证恢复（人工确认运行时条件后再加 --ack-runtime-checks）
 python g35_admin.py verify-recovery \
   --config "$YRCACHE_CONFIG" \
   --osd-id "$FAILED_OSD" \
@@ -555,34 +976,35 @@ python g35_admin.py verify-recovery \
 
 ### 为什么 `yrcache-g35-admin create-probes` 报 invalid choice？
 
-说明你执行的是环境中已安装的旧版命令，不是当前目录的 `g35_admin.py`。直接运行：
+说明执行的是环境中旧版命令，不是当前目录的 `g35_admin.py`。请用：
 
 ```bash
 python g35_admin.py create-probes --config yrcache.yaml --dry-run
 ```
 
-也可以检查当前命令指向哪里：
-
-```bash
-which yrcache-g35-admin
-python -c "import yrcache.tools.g35_admin as m; print(m.__file__)"
-```
-
 ### 为什么 dry-run 能跑，execute 报 `需要已编译的 yrcache.c_ops`？
 
-`dry-run` 只预览路径，不需要底层 YRFS 能力。`execute` 需要生成探活 payload，并在写入后校验 YRFS 布局，所以必须在包含已编译 `yrcache.c_ops` 的运行环境中执行。
+`dry-run` 只预览路径。`execute` 需要生成 payload 并校验 YRFS 布局，必须能 `import yrcache.c_ops`。
 
 ### `created_but_wrong_layout` 是否可以忽略？
 
-不建议忽略。它表示文件内容已写入，但 YRFS 报告该探活文件没有只分布在目标 OSD 上。后续探活判断会认为该 OSD 的探活文件不合格。
+不建议。表示内容已写，但文件没有只落在目标 OSD，后续探活会判该 OSD 不合格。
 
 ### `delete-files --execute` 为什么强制要求 `--require-no-redis-references`？
 
-这是防止 Redis 仍然命中旧文件。只有 Redis 中没有引用后，才允许删除 YRFS 数据文件。
+防止 Redis 仍命中旧文件。只有 Redis 无引用后才允许删 YRFS 数据文件。
 
 ### manifest 里能不能写绝对路径？
 
-不能。manifest 必须是相对 `mount_path` 的路径。绝对路径和越过挂载点的路径都会被拒绝。
+不能。必须是相对 `mount_path` 的路径；绝对路径和越过挂载点的路径都会被拒绝。
+
+### 不指定 `--output` / `--report` 会生成文件吗？
+
+不会。结果只打印到终端 stdout。需要落盘时显式指定路径，或自行重定向。
+
+### `list-redis-records` 和 `delete-redis-records --dry-run` 有何区别？
+
+底层扫描相同，命中集合一致。前者偏只读查询（支持 `--count-only`），后者是删除预演并可继续 `--execute`。预览阶段二选一即可。
 
 ## 退出码
 
@@ -590,12 +1012,12 @@ python -c "import yrcache.tools.g35_admin as m; print(m.__file__)"
 | --- | --- |
 | `0` | 命令成功。 |
 | `1` | 参数、配置、依赖、Redis、文件或其他执行错误。 |
-| `2` | `verify-recovery` 静态检查可能通过，但未完成所有运行时确认，或整体恢复状态未达到 `ok`。 |
+| `2` | `verify-recovery` 未达到整体 `ok`（例如未 `--ack-runtime-checks`，或静态检查未过）。 |
 
 ## 安全建议
 
-- 生产环境先跑 `--dry-run`，保存报告并人工核对数量。
-- 删除 Redis 后必须重新查询确认 `matched` 为 `0`。
+- 生产环境先 `--dry-run`，核对数量后再 `--execute`。
+- 删 Redis 后必须再查一次，确认 `matched=0`。
 - 不要跳过 `--require-no-redis-references`。
-- 探活文件创建后检查 `status` 是否全部为 `created`，且 `verify` 是否全部为 `ok`。
-- `verify-recovery --ack-runtime-checks` 只应在人工确认运行时条件后使用。
+- 探活创建后检查全部 `status=created` 且 `verify=ok`。
+- `--ack-runtime-checks` 只应在人工确认运行时条件后使用。

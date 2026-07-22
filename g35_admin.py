@@ -567,26 +567,42 @@ def _write_report(report: dict[str, Any], output: str | None) -> None:
 
 
 def _add_redis_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", help="YRCache YAML 配置文件")
-    parser.add_argument("--redis-host")
-    parser.add_argument("--redis-port", type=int)
-    parser.add_argument("--redis-db", type=int)
-    parser.add_argument("--redis-password")
-    parser.add_argument("--redis-pin-key")
+    parser.add_argument("--config", help="YRCache YAML 配置文件；也可只提供 Redis 覆盖参数")
+    parser.add_argument("--redis-host", help="Redis 地址；覆盖配置中的 redis_host")
+    parser.add_argument("--redis-port", type=int, help="Redis 端口；覆盖配置中的 redis_port")
+    parser.add_argument("--redis-db", type=int, help="Redis DB；覆盖配置中的 redis_db")
+    parser.add_argument(
+        "--redis-password",
+        help="Redis 密码；优先于环境变量 YRCACHE_REDIS_PASSWORD",
+    )
+    parser.add_argument("--redis-pin-key", help="pin zset key；覆盖配置中的 redis_pin_key")
     parser.add_argument("--manifest", required=True, help="受影响文件 JSON 清单")
-    parser.add_argument("--scan-batch", type=int, default=1000)
+    parser.add_argument(
+        "--scan-batch",
+        type=int,
+        default=1000,
+        help="Redis SCAN 的 COUNT 提示值，默认 1000",
+    )
 
 
 def _add_mode_options(parser: argparse.ArgumentParser) -> None:
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--dry-run", action="store_true", help="只显示将要执行的操作，默认行为")
+    mode.add_argument("--dry-run", action="store_true", help="只预览将要执行的操作，默认行为")
     mode.add_argument("--execute", action="store_true", help="实际执行操作")
 
 
 def _add_config_redis_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", required=True, help="YRCache YAML 配置文件")
-    parser.add_argument("--redis-password")
-    parser.add_argument("--scan-batch", type=int, default=1000)
+    parser.add_argument(
+        "--redis-password",
+        help="Redis 密码；优先于环境变量 YRCACHE_REDIS_PASSWORD",
+    )
+    parser.add_argument(
+        "--scan-batch",
+        type=int,
+        default=1000,
+        help="Redis SCAN 的 COUNT 提示值，默认 1000",
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -595,8 +611,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     list_parser = subparsers.add_parser("list-redis-records", help="查询指向受影响文件的 Redis 记录")
     _add_redis_options(list_parser)
-    list_parser.add_argument("--output")
-    list_parser.add_argument("--count-only", action="store_true")
+    list_parser.add_argument(
+        "--output",
+        help="把 JSON 结果写入该文件；不指定则打印到终端标准输出",
+    )
+    list_parser.add_argument(
+        "--count-only",
+        action="store_true",
+        help="只输出 scanned_keys 和 matched，不输出 records 明细",
+    )
 
     delete_parser = subparsers.add_parser(
         "delete-redis-records",
@@ -604,22 +627,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     _add_redis_options(delete_parser)
     _add_mode_options(delete_parser)
-    delete_parser.add_argument("--report")
+    delete_parser.add_argument(
+        "--report",
+        help="把 JSON 报告写入该文件；不指定则打印到终端标准输出",
+    )
 
     files_parser = subparsers.add_parser("list-files", help="生成或检查受影响文件清单")
     files_parser.add_argument("--config", required=True, help="YRCache YAML 配置文件")
     source = files_parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--osd-id", type=int)
-    source.add_argument("--manifest")
-    files_parser.add_argument("--summary", action="store_true")
-    files_parser.add_argument("--output")
+    source.add_argument(
+        "--osd-id",
+        "--osd_id",
+        dest="osd_id",
+        type=int,
+        help="按 OSD ID 扫描数据目录，生成受影响文件清单",
+    )
+    source.add_argument("--manifest", help="已有清单路径；用于摘要检查文件数量和是否仍存在")
+    files_parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="与 --manifest 一起使用：只输出文件数/仍存在数摘要；不指定则输出每个文件的存在状态明细",
+    )
+    files_parser.add_argument(
+        "--output",
+        help="把 JSON 结果写入该文件；不指定则打印到终端标准输出",
+    )
 
     delete_files_parser = subparsers.add_parser("delete-files", help="删除受影响的 YRFS 数据文件")
     _add_config_redis_options(delete_files_parser)
-    delete_files_parser.add_argument("--manifest", required=True)
-    delete_files_parser.add_argument("--require-no-redis-references", action="store_true")
+    delete_files_parser.add_argument("--manifest", required=True, help="受影响文件 JSON 清单")
+    delete_files_parser.add_argument(
+        "--require-no-redis-references",
+        action="store_true",
+        help="要求 Redis 中已无清单文件引用；--execute 时必须指定",
+    )
     _add_mode_options(delete_files_parser)
-    delete_files_parser.add_argument("--report")
+    delete_files_parser.add_argument(
+        "--report",
+        help="把 JSON 报告写入该文件；不指定则打印到终端标准输出",
+    )
 
     create_probes_parser = subparsers.add_parser(
         "create-probes",
@@ -636,20 +682,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="只处理指定的一个或多个 OSD；默认处理配置中的全部 OSD",
     )
     create_probes_parser.add_argument(
-        "--overwrite", action="store_true", help="覆盖已存在的探活文件，默认跳过"
+        "--overwrite", action="store_true", help="覆盖已存在的探活文件：先删除再 yrcli 重建；默认跳过"
     )
     create_probes_parser.add_argument(
         "--verbose", action="store_true", help="输出每个 OSD 的分步执行日志到 stderr"
     )
     _add_mode_options(create_probes_parser)
-    create_probes_parser.add_argument("--report")
+    create_probes_parser.add_argument(
+        "--report",
+        help="把 JSON 报告写入该文件；不指定则打印到终端标准输出",
+    )
 
     verify_parser = subparsers.add_parser("verify-recovery", help="验证 OSD 恢复的静态条件")
     _add_config_redis_options(verify_parser)
-    verify_parser.add_argument("--osd-id", type=int, required=True)
-    verify_parser.add_argument("--manifest", required=True)
-    verify_parser.add_argument("--ack-runtime-checks", action="store_true")
-    verify_parser.add_argument("--report")
+    verify_parser.add_argument(
+        "--osd-id",
+        "--osd_id",
+        dest="osd_id",
+        type=int,
+        required=True,
+        help="本次故障/恢复的目标 OSD ID",
+    )
+    verify_parser.add_argument("--manifest", required=True, help="受影响文件 JSON 清单")
+    verify_parser.add_argument(
+        "--ack-runtime-checks",
+        action="store_true",
+        help="确认已完成运行时人工检查；未指定时即使静态检查通过也返回退出码 2",
+    )
+    verify_parser.add_argument(
+        "--report",
+        help="把 JSON 报告写入该文件；不指定则打印到终端标准输出",
+    )
     return parser.parse_args(argv)
 
 
@@ -657,13 +720,33 @@ def _handle_list_files(args: argparse.Namespace) -> int:
     g35 = _load_g35_settings(args)
     if args.manifest:
         files = load_manifest(args.manifest)
-        report = {
-            "mount_path": str(g35.mount_path),
-            "data_path": str(g35.data_path),
-            "files": len(files),
-            "existing": sum(_path_exists_tolerant(g35.mount_path / file) for file in files),
-        }
+        existing_flags = [_path_exists_tolerant(g35.mount_path / file) for file in sorted(files)]
+        if args.summary:
+            report: dict[str, Any] = {
+                "mount_path": str(g35.mount_path),
+                "data_path": str(g35.data_path),
+                "files": len(files),
+                "existing": sum(existing_flags),
+            }
+        else:
+            details = [
+                {
+                    "file": file,
+                    "status": "existing" if exists else "missing",
+                }
+                for file, exists in zip(sorted(files), existing_flags)
+            ]
+            report = {
+                "mount_path": str(g35.mount_path),
+                "data_path": str(g35.data_path),
+                "files": len(files),
+                "existing": sum(existing_flags),
+                "missing": len(files) - sum(existing_flags),
+                "details": details,
+            }
     else:
+        if args.summary:
+            raise ValueError("--summary 只能与 --manifest 一起使用")
         if args.osd_id not in g35.osd_ids:
             raise ValueError(f"OSD {args.osd_id} 不在 g35_osd_ids 中")
         files, scan_errors = list_files(g35, args.osd_id)
