@@ -628,8 +628,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     _add_redis_options(delete_parser)
     _add_mode_options(delete_parser)
     delete_parser.add_argument(
-        "--report",
-        help="把 JSON 报告写入该文件；不指定则打印到终端标准输出",
+        "--output",
+        help="可选：把 JSON 操作记录写入该文件；不指定则打印到终端",
     )
 
     files_parser = subparsers.add_parser("list-files", help="生成或检查受影响文件清单")
@@ -642,7 +642,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         help="按 OSD ID 扫描数据目录，生成受影响文件清单",
     )
-    source.add_argument("--manifest", help="已有清单路径；用于摘要检查文件数量和是否仍存在")
+    source.add_argument("--manifest", help="已有清单路径；用于检查文件是否仍存在")
+    files_parser.add_argument(
+        "--report",
+        help="生成清单时写入 JSON 文件，供后续命令 --manifest 使用（--osd-id 模式必填）",
+    )
     files_parser.add_argument(
         "--summary",
         action="store_true",
@@ -650,7 +654,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     files_parser.add_argument(
         "--output",
-        help="把 JSON 结果写入该文件；不指定则打印到终端标准输出",
+        help="检查清单时可选写入 JSON 记录；不指定则打印到终端（--manifest 模式）",
     )
 
     delete_files_parser = subparsers.add_parser("delete-files", help="删除受影响的 YRFS 数据文件")
@@ -663,8 +667,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     _add_mode_options(delete_files_parser)
     delete_files_parser.add_argument(
-        "--report",
-        help="把 JSON 报告写入该文件；不指定则打印到终端标准输出",
+        "--output",
+        help="可选：把 JSON 操作记录写入该文件；不指定则打印到终端",
     )
 
     create_probes_parser = subparsers.add_parser(
@@ -689,11 +693,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     _add_mode_options(create_probes_parser)
     create_probes_parser.add_argument(
-        "--report",
-        help="把 JSON 报告写入该文件；不指定则打印到终端标准输出",
+        "--output",
+        help="可选：把 JSON 操作记录写入该文件；不指定则打印到终端",
     )
 
-    verify_parser = subparsers.add_parser("verify-recovery", help="验证 OSD 恢复的静态条件")
+    verify_parser = subparsers.add_parser(
+        "verify-recovery",
+        help="验证指定故障 OSD 的受影响文件与 Redis 记录是否已清理完成",
+    )
     _add_config_redis_options(verify_parser)
     verify_parser.add_argument(
         "--osd-id",
@@ -705,13 +712,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     verify_parser.add_argument("--manifest", required=True, help="受影响文件 JSON 清单")
     verify_parser.add_argument(
-        "--ack-runtime-checks",
-        action="store_true",
-        help="确认已完成运行时人工检查；未指定时即使静态检查通过也返回退出码 2",
-    )
-    verify_parser.add_argument(
-        "--report",
-        help="把 JSON 报告写入该文件；不指定则打印到终端标准输出",
+        "--output",
+        help="可选：把 JSON 操作记录写入该文件；不指定则打印到终端",
     )
     return parser.parse_args(argv)
 
@@ -719,6 +721,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _handle_list_files(args: argparse.Namespace) -> int:
     g35 = _load_g35_settings(args)
     if args.manifest:
+        if args.report:
+            raise ValueError("检查清单请使用 --output；--report 仅用于 --osd-id 生成清单")
         files = load_manifest(args.manifest)
         existing_flags = [_path_exists_tolerant(g35.mount_path / file) for file in sorted(files)]
         if args.summary:
@@ -744,20 +748,26 @@ def _handle_list_files(args: argparse.Namespace) -> int:
                 "missing": len(files) - sum(existing_flags),
                 "details": details,
             }
-    else:
-        if args.summary:
-            raise ValueError("--summary 只能与 --manifest 一起使用")
-        if args.osd_id not in g35.osd_ids:
-            raise ValueError(f"OSD {args.osd_id} 不在 g35_osd_ids 中")
-        files, scan_errors = list_files(g35, args.osd_id)
-        report = {
-            "mount_path": str(g35.mount_path),
-            "data_path": str(g35.data_path),
-            "osd_id": args.osd_id,
-            "files": list(files),
-            "scan_errors": list(scan_errors),
-        }
-    _write_report(report, args.output)
+        _write_report(report, args.output)
+        return 0
+
+    if args.output:
+        raise ValueError("生成清单请使用 --report；--output 仅用于 --manifest 检查清单")
+    if not args.report:
+        raise ValueError("生成受影响文件清单必须指定 --report")
+    if args.summary:
+        raise ValueError("--summary 只能与 --manifest 一起使用")
+    if args.osd_id not in g35.osd_ids:
+        raise ValueError(f"OSD {args.osd_id} 不在 g35_osd_ids 中")
+    files, scan_errors = list_files(g35, args.osd_id)
+    report = {
+        "mount_path": str(g35.mount_path),
+        "data_path": str(g35.data_path),
+        "osd_id": args.osd_id,
+        "files": list(files),
+        "scan_errors": list(scan_errors),
+    }
+    _write_report(report, args.report)
     return 0
 
 
@@ -779,7 +789,7 @@ def _handle_create_probes(args: argparse.Namespace) -> int:
         args.verbose,
         osd_ids,
     )
-    _write_report(report, args.report)
+    _write_report(report, args.output)
     return 0
 
 
@@ -809,12 +819,12 @@ def _handle_redis_command(
         _write_report(
             {"mode": "dry-run", "scanned_keys": result.scanned_keys,
              "would_delete": len(records), "records": records},
-            args.report,
+            args.output,
         )
         return 0
     report = delete_redis_records(client, result.records, settings.pin_key)
     report.update({"mode": "execute", "scanned_keys": result.scanned_keys, "matched": len(records)})
-    _write_report(report, args.report)
+    _write_report(report, args.output)
     return 0
 
 
@@ -822,7 +832,7 @@ def _handle_delete_files(
     args: argparse.Namespace, g35: G35Settings, file_paths: frozenset[str], result: ScanResult
 ) -> int:
     _require_no_redis_references(args, result, "删除文件")
-    _write_report(delete_files(g35.mount_path, file_paths, args.execute), args.report)
+    _write_report(delete_files(g35.mount_path, file_paths, args.execute), args.output)
     return 0
 
 
@@ -834,26 +844,23 @@ def _require_no_redis_references(args: argparse.Namespace, result: ScanResult, o
 
 
 def _handle_verify_recovery(
-    args: argparse.Namespace, g35: G35Settings, existing_files: list[str], result: ScanResult
+    args: argparse.Namespace,
+    g35: G35Settings,
+    file_paths: frozenset[str],
+    existing_files: list[str],
+    result: ScanResult,
 ) -> int:
     records = [record.to_dict() for record in result.records]
-    probes = [verify_probe(g35, osd_id) for osd_id in g35.osd_ids]
-    static_checks_ok = not existing_files and not records and all(probe["status"] == "ok" for probe in probes)
-    ok = static_checks_ok and args.ack_runtime_checks
+    ok = not existing_files and not records
     report = {
         "ok": ok,
-        "static_checks_ok": static_checks_ok,
-        "runtime_checks_acknowledged": args.ack_runtime_checks,
+        "osd_id": args.osd_id,
+        "mount_path": str(g35.mount_path),
+        "manifest_files": len(file_paths),
         "remaining_files": existing_files,
         "remaining_redis_records": records,
-        "probes": probes,
-        "runtime_checks_required": [
-            "确认各 YRCache 实例已经移除目标 OSD 的异常标记",
-            "确认文件访问模式为 CLOSED，或因其他异常 OSD 保持 DEGRADED",
-            "确认原受影响 KV Cache 查询返回未命中并可重新计算",
-        ],
     }
-    _write_report(report, args.report)
+    _write_report(report, args.output)
     return 0 if ok else 2
 
 
@@ -875,7 +882,7 @@ def _execute(args: argparse.Namespace) -> int:
     existing_files = sorted(
         file for file in file_paths if _path_exists_tolerant(g35.mount_path / file)
     )
-    return _handle_verify_recovery(args, g35, existing_files, result)
+    return _handle_verify_recovery(args, g35, file_paths, existing_files, result)
 
 
 def main(argv: list[str] | None = None) -> int:
