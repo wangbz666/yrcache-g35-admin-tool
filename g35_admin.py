@@ -699,17 +699,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     verify_parser = subparsers.add_parser(
         "verify-recovery",
-        help="验证指定故障 OSD 的受影响文件与 Redis 记录是否已清理完成",
+        help="验证受影响文件与 Redis 记录是否已清理完成",
     )
     _add_config_redis_options(verify_parser)
-    verify_parser.add_argument(
-        "--osd-id",
-        "--osd_id",
-        dest="osd_id",
-        type=int,
-        required=True,
-        help="本次故障/恢复的目标 OSD ID",
-    )
     verify_parser.add_argument("--manifest", required=True, help="受影响文件 JSON 清单")
     verify_parser.add_argument(
         "--output",
@@ -854,7 +846,6 @@ def _handle_verify_recovery(
     ok = not existing_files and not records
     report = {
         "ok": ok,
-        "osd_id": args.osd_id,
         "mount_path": str(g35.mount_path),
         "manifest_files": len(file_paths),
         "remaining_files": existing_files,
@@ -877,8 +868,6 @@ def _execute(args: argparse.Namespace) -> int:
     g35 = _load_g35_settings(args, shared)
     if args.command == "delete-files":
         return _handle_delete_files(args, g35, file_paths, result)
-    if args.osd_id not in g35.osd_ids:
-        raise ValueError(f"OSD {args.osd_id} 不在 g35_osd_ids 中")
     existing_files = sorted(
         file for file in file_paths if _path_exists_tolerant(g35.mount_path / file)
     )

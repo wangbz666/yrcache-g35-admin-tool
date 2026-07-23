@@ -136,7 +136,7 @@ delete-files --manifest affected-files.json
 - 其他命令也只用 `--manifest` 读取清单，用可选 `--output` 留档。
 - 不指定 `--output` 时，JSON 打印到终端 stdout。
 - `create-probes --verbose` 的分步日志打到 stderr，不与 JSON 混写。
-- 涉及 OSD 的参数统一支持 `--osd-id` 与 `--osd_id`：`list-files`、`create-probes`、`verify-recovery`。
+- 涉及 OSD 的参数统一支持 `--osd-id` 与 `--osd_id`：`list-files`、`create-probes`。
 
 ---
 
@@ -832,14 +832,14 @@ python g35_admin.py create-probes \
 
 命令：`verify-recovery`
 
-验证指定故障 OSD 的受影响文件与 Redis 记录是否已清理完成。
+验证 `--manifest` 中受影响文件与 Redis 记录是否已清理完成。
 
 只检查两项：
 
-1. **YRFS**：`--manifest` 清单中的文件是否已全部不存在。
+1. **YRFS**：清单中的文件是否已全部不存在。
 2. **Redis**：是否仍有记录指向清单中的文件。
 
-不检查探活文件、运行时状态或其他 OSD。
+不检查探活文件、运行时状态或其他 OSD。检查范围完全由 `--manifest` 决定。
 
 ### 7.1 配置示例
 
@@ -850,7 +850,6 @@ python g35_admin.py create-probes \
 ```bash
 python g35_admin.py verify-recovery \
   --config "$YRCACHE_CONFIG" \
-  --osd-id "$FAILED_OSD" \
   --manifest "$WORK_DIR/affected-files.json" \
   --output "$WORK_DIR/verify-recovery-result.json"
 ```
@@ -860,7 +859,6 @@ python g35_admin.py verify-recovery \
 | 参数 | 必填 | 作用 / 不给会怎样 |
 | --- | --- | --- |
 | `--config` | 是 | YAML 配置。 |
-| `--osd-id` / `--osd_id` | 是 | 本次故障/恢复的目标 OSD；须在 `g35_osd_ids` 中，写入报告便于识别。 |
 | `--manifest` | 是 | 第 1 节生成的受影响文件清单（`--report` 产物）。 |
 | `--scan-batch` | 否 | Redis `SCAN COUNT`，默认 `1000`。 |
 | `--redis-password` | 否 | Redis 密码。 |
@@ -873,7 +871,6 @@ python g35_admin.py verify-recovery \
 ```json
 {
   "ok": true,
-  "osd_id": 306,
   "mount_path": "/mnt/real-yrfs",
   "manifest_files": 2,
   "remaining_files": [],
@@ -886,7 +883,6 @@ python g35_admin.py verify-recovery \
 ```json
 {
   "ok": false,
-  "osd_id": 306,
   "mount_path": "/mnt/real-yrfs",
   "manifest_files": 2,
   "remaining_files": [
@@ -909,7 +905,6 @@ python g35_admin.py verify-recovery \
 | 字段 | 含义 |
 | --- | --- |
 | `ok` | 清单文件与 Redis 记录是否均已清理完成。 |
-| `osd_id` | 本次验证的目标故障 OSD。 |
 | `mount_path` | YRFS 挂载点。 |
 | `manifest_files` | 清单中的文件总数。 |
 | `remaining_files` | 仍存在于 YRFS 上的清单文件。期望 `[]`。 |
@@ -986,7 +981,6 @@ python g35_admin.py create-probes \
 # 7. 验证清理完成
 python g35_admin.py verify-recovery \
   --config "$YRCACHE_CONFIG" \
-  --osd-id "$FAILED_OSD" \
   --manifest "$WORK_DIR/affected-files.json" \
   --output "$WORK_DIR/verify-recovery-result.json"
 ```
